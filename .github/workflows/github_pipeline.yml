@@ -139,6 +139,7 @@ jobs:
 
   Linux-regression-test:
     needs: upstream-sync
+    timeout-minutes: 43200
     if: github.ref_name == 'master' && needs.upstream-sync.outputs.skip_smoke_and_reg == 'false' || startsWith(github.ref_name, 'develop/')
     runs-on: jaltarang.linux
     steps:

@@ -71,7 +71,7 @@ jobs:
 
   Windows-smoke-test:
     needs: upstream-sync
-    if: needs.upstream-sync.outputs.skip_smoke_and_reg == 'false'
+    if: github.ref_name == 'master' && needs.upstream-sync.outputs.skip_smoke_and_reg == 'false' || startsWith(github.ref_name, 'develop/')
     runs-on: tabla.windows
     steps:
     - name: Preparing workspace
@@ -105,7 +105,7 @@ jobs:
 
   Linux-smoke-test:
     needs: upstream-sync
-    if: needs.upstream-sync.outputs.skip_smoke_and_reg == 'false'
+    if: github.ref_name == 'master' && needs.upstream-sync.outputs.skip_smoke_and_reg == 'false' || startsWith(github.ref_name, 'develop/')
     runs-on: oboe.linux
     steps:
       - name: Preparing workspace
@@ -120,7 +120,7 @@ jobs:
           fi
           git clone $DOWNSTREAM_REPO "$DOWNSTREAM_DIR"
           cd "$DOWNSTREAM_DIR"
-          git checkout %GITHUB_REF_NAME%
+          git checkout "$GITHUB_REF_NAME"
 
           # test-harness-git
           if [ -d "$HARNESS_DIR" ]; then
@@ -139,7 +139,7 @@ jobs:
 
   Linux-regression-test:
     needs: upstream-sync
-    if: needs.upstream-sync.outputs.skip_smoke_and_reg == 'false'
+    if: github.ref_name == 'master' && needs.upstream-sync.outputs.skip_smoke_and_reg == 'false' || startsWith(github.ref_name, 'develop/')
     runs-on: harmonica.linux
     steps:
       - name: Preparing workspace
@@ -154,7 +154,7 @@ jobs:
           fi
           git clone $DOWNSTREAM_REPO "$DOWNSTREAM_DIR"
           cd "$DOWNSTREAM_DIR"
-          git checkout %GITHUB_REF_NAME%
+          git checkout "$GITHUB_REF_NAME"
 
           # test-harness-git
           if [ -d "$HARNESS_DIR" ]; then

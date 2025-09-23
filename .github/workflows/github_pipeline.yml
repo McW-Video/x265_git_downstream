@@ -7,8 +7,8 @@ on:
     branches: [ "master", "develop/*" ]
 
 env:
-  DOWNSTREAM_REPO: https://github.com/McW-Video/x265_git_downstream.git
-  UPSTREAM_REPO: https://github.com/AKILAN-SIVA/x265_git.git
+  DOWNSTREAM_REPO: https://x-access-token:${{ secrets.PUSH_TOKEN }}@github.com/McW-Video/x265_git_downstream.git
+  UPSTREAM_REPO: https://x-access-token:${{ secrets.PUSH_TOKEN }}@github.com/AKILAN-SIVA/x265_git.git
   MASTER_BRANCH: master
 
 jobs:

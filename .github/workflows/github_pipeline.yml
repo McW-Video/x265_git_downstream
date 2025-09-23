@@ -140,13 +140,13 @@ jobs:
   Linux-regression-test:
     needs: upstream-sync
     if: github.ref_name == 'master' && needs.upstream-sync.outputs.skip_smoke_and_reg == 'false' || startsWith(github.ref_name, 'develop/')
-    runs-on: harmonica.linux
+    runs-on: jaltarang.linux
     steps:
       - name: Preparing workspace
         shell: bash
         run: |
-          DOWNSTREAM_DIR="/home/mcw/jenkins_tests/x265_Regression/x265_git_downstream"
-          HARNESS_DIR="/home/mcw/jenkins_tests/x265_Regression/test-harness-git"
+          DOWNSTREAM_DIR="/home/mcw/Akil/x265_regression/x265_git_downstream"
+          HARNESS_DIR="/home/mcw/Akil/x265_regression/test-harness-git"
 
           if [ -d "$DOWNSTREAM_DIR" ]; then
               echo "Downstream repo exists. Deleting..."
@@ -168,5 +168,5 @@ jobs:
       - name: Regression test
         shell: bash
         run: |
-          cd /home/mcw/jenkins_tests/x265_Regression/test-harness-git
-          python regression-test.py
+          cd /home/mcw/Akil/x265_regression/test-harness-git
+          python3 regression-test.py

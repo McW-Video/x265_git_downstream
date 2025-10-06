@@ -10,12 +10,14 @@ env:
   DOWNSTREAM_REPO: https://x-access-token:${{ secrets.PUSH_TOKEN }}@github.com/McW-Video/x265_git_downstream.git
   UPSTREAM_REPO: https://x-access-token:${{ secrets.PUSH_TOKEN }}@github.com/AKILAN-SIVA/x265_git.git
   MASTER_BRANCH: master
+  BITBUCKET_TOKEN: ${{ secrets.BITBUCKET_APP_PASSWORD }}
+  BITBUCKET_USERNAME: ${{ secrets.BITBUCKET_USERNAME }}
 
 jobs:
   upstream-sync:
     runs-on: oboe.linux
     outputs:
-      skip_smoke: ${{ steps.compare.outputs.skip_smoke }}
+      skip_smoke_and_reg: ${{ steps.compare.outputs.skip_smoke_and_reg }}
     steps:
       - name: Setup directory and repos
         shell: bash
@@ -68,17 +70,173 @@ jobs:
             git diff --name-only --diff-filter=U
             exit 1
           fi
+  Auto-create-pr:
+    name: Auto-create PR
+    runs-on: ubuntu-latest
+    outputs:
+      skip_smoke: ${{ steps.pr.outputs.SKIP_SMOKE }}
+    steps:
+      - name: Setup environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl jq git python3 python3-pip
+
+      - name: Set GitHub user
+        run: |
+          git config --global user.name "Akilan_Sivakumar"
+          git config --global user.email "akilan.sivakumar@multicorewareinc.com"
+
+      - name: Auto-create PR
+        id: pr
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.PUSH_TOKEN }}
+          GITHUB_BRANCH: ${{ github.ref_name }}
+        run: |
+          set -e
+          SKIP_SMOKE=false
+          echo "Branch: $GITHUB_BRANCH"
+
+          if [ "$GITHUB_BRANCH" != "$MASTER_BRANCH" ]; then
+            # Non-master branch logic
+            TMP_DIR="/tmp/x265-pr"
+            rm -rf "$TMP_DIR"
+
+            # Clone downstream master
+            git clone --branch $MASTER_BRANCH $DOWNSTREAM_REPO "$TMP_DIR"
+            cd "$TMP_DIR"
+            git remote add upstream $UPSTREAM_REPO
+            git fetch upstream $MASTER_BRANCH
+
+            if ! git merge-base --is-ancestor upstream/$MASTER_BRANCH HEAD; then
+              echo "Rebasing downstream/master on upstream/master..."
+              git rebase upstream/$MASTER_BRANCH
+              git push origin $MASTER_BRANCH
+            fi
+
+            # Rebase source branch on top of downstream/master
+            SRC_BRANCH="$GITHUB_BRANCH"
+            TMP_DIR="/tmp/x265-branch"
+            rm -rf "$TMP_DIR"
+            git clone --branch "$SRC_BRANCH" $DOWNSTREAM_REPO "$TMP_DIR"
+            cd "$TMP_DIR"
+            git remote add origin_downstream $DOWNSTREAM_REPO
+            git fetch origin_downstream $MASTER_BRANCH
+
+            if ! git merge-base --is-ancestor origin_downstream/$MASTER_BRANCH HEAD; then
+              echo "Rebasing $SRC_BRANCH on downstream/master..."
+              git rebase origin_downstream/$MASTER_BRANCH
+              git push origin "$SRC_BRANCH" --force-with-lease
+              SKIP_SMOKE=true
+            fi
+
+            # Check existing PR
+            EXISTING_PR=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+              "https://api.github.com/repos/McW-Video/x265_git_downstream/pulls?head=McW-Video:$SRC_BRANCH&base=master" | jq '. | length')
+            if [ "$EXISTING_PR" -eq 0 ]; then
+              echo "Creating PR $SRC_BRANCH -> master"
+              curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "{
+                      \"title\": \"Auto PR: $SRC_BRANCH -> master\",
+                      \"head\": \"$SRC_BRANCH\",
+                      \"base\": \"master\",
+                      \"body\": \"Automatically created PR from branch $SRC_BRANCH\"
+                    }" \
+                "https://api.github.com/repos/McW-Video/x265_git_downstream/pulls"
+            else
+              echo "PR already exists. Skipping."
+            fi
+
+          else
+            # Master branch → upstream master sync
+            TMP_DIR="/tmp/x265-master-sync"
+            rm -rf "$TMP_DIR"
+            git clone $DOWNSTREAM_REPO "$TMP_DIR"
+            cd "$TMP_DIR"
+            git remote add upstream $UPSTREAM_REPO
+            git fetch upstream
+            git fetch origin
+
+            if ! git merge-base --is-ancestor upstream/$MASTER_BRANCH HEAD; then
+              echo "Rebasing downstream/master on upstream/master..."
+              git rebase upstream/$MASTER_BRANCH
+              git push origin $MASTER_BRANCH
+              SKIP_SMOKE=true
+              echo "Exiting after master sync."
+            fi
+
+            # Clean stale sync branches
+            SYNC_BRANCHES=$(git ls-remote --heads origin "sync*" | awk '{print $2}' | sed 's@refs/heads/@@')
+            ACTIVE_BRANCHES=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+              "https://api.github.com/repos/AKILAN-SIVA/x265_git/pulls?state=open" | jq -r '.[]?.head.ref')
+
+            for BR in $SYNC_BRANCHES; do
+              if echo "$ACTIVE_BRANCHES" | grep -qx "$BR"; then
+                echo "Keeping active PR branch: $BR"
+              else
+                echo "Deleting stale sync branch: $BR"
+                git push origin --delete "$BR" || true
+              fi
+            done
+
+            # Create new sync branch
+            SYNC_BRANCH="sync-temp-$(date +%s)"
+            git checkout -B "$SYNC_BRANCH" upstream/$MASTER_BRANCH
+
+            # Cherry-pick filtered commits
+            LAST_SYNC_COMMIT=$(git log upstream/$MASTER_BRANCH --grep="\[skip-pr\]" -n 1 --pretty=format:"%H" || true)
+            if [ -n "$LAST_SYNC_COMMIT" ]; then
+              COMMITS=$(git log --reverse --pretty=format:"%H" $LAST_SYNC_COMMIT..origin/$MASTER_BRANCH)
+            else
+              COMMITS=$(git log --reverse --pretty=format:"%H" upstream/$MASTER_BRANCH..origin/$MASTER_BRANCH)
+            fi
+
+            PIPELINE_REGEX='(^|/)(\.github/workflows/.*|Jenkinsfile|azure-pipelines\.ya?ml)$'
+            while read -r hash; do
+              [ -z "$hash" ] && continue
+              changed="$(git show --pretty='' --name-only "$hash")"
+              non_pipeline="$(printf '%s\n' "$changed" | grep -Ev "$PIPELINE_REGEX" || true)"
+              if [ -z "$non_pipeline" ]; then
+                echo "Skipping pipeline-only commit: $(git log -1 --pretty=%s "$hash")"
+                continue
+              fi
+              echo "Cherry-picking: $(git log -1 --pretty=%h\ %s "$hash")"
+              git cherry-pick "$hash" || git cherry-pick --skip || true
+            done <<< "$COMMITS"
+
+            # Push sync branch & create PR
+            git push -f origin "$SYNC_BRANCH"
+            EXISTING_PR=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+              "https://api.github.com/repos/AKILAN-SIVA/x265_git/pulls?head=McW-Video:$SYNC_BRANCH&base=$MASTER_BRANCH" | jq '. | length')
+            if [ "$EXISTING_PR" -eq 0 ]; then
+              echo "Creating new PR for $SYNC_BRANCH → $MASTER_BRANCH"
+              curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "{
+                      \"title\": \"Sync downstream master (filtered) to master\",
+                      \"head\": \"$SYNC_BRANCH\",
+                      \"base\": \"$MASTER_BRANCH\",
+                      \"body\": \"Auto-created PR with filtered commits (no pipeline files).\" 
+                    }" \
+                "https://api.github.com/repos/AKILAN-SIVA/x265_git/pulls"
+            else
+              echo "PR already exists for $SYNC_BRANCH → $MASTER_BRANCH. Skipping."
+            fi
+          fi
+
+          echo "SKIP_SMOKE=$SKIP_SMOKE" >> $GITHUB_OUTPUT
 
   Windows-smoke-test:
     needs: upstream-sync
-    if: github.ref_name == 'master' && needs.upstream-sync.outputs.skip_smoke_and_reg == 'false' || startsWith(github.ref_name, 'develop/')
+    if: ((github.ref_name == 'master' && needs.upstream-sync.outputs.skip_smoke_and_reg == 'false') || startsWith(github.ref_name, 'develop/'))
     runs-on: tabla.windows
+    env:
+        DOWNSTREAM_DIR: C:\jenkins_test\x265_smoke\x265_git_downstream
+        TEST_HARNESS_DIR: C:\jenkins_test\x265_smoke\test-harness-git
     steps:
     - name: Preparing workspace
       shell: cmd
-      env:
-        DOWNSTREAM_DIR: C:\jenkins_test\x265_smoke\x265_git_downstream
-        TEST_HARNESS_DIR: C:\jenkins_test\x265_smoke\test-harness-git
       run: |
         IF EXIST "%DOWNSTREAM_DIR%" (
             echo "Downstream repo exists. Deleting..."
@@ -92,10 +250,10 @@ jobs:
         IF EXIST "%TEST_HARNESS_DIR%" (
             echo "test-harness-git exists. Pulling latest changes..."
             cd "%TEST_HARNESS_DIR%"
-            git pull https://Akilan_Sivakumar:ATATT3xFfGF0dQC-D-7njcKkdJyNco1C_pbPgXDuAITR0s8T2igGU7Izr4EskQ5QeiWuMDuX8bUlLb0tXZ4yltzf60TvtnkpimbeQw_x2XDSpTomsjutMpgIuU6AmokMcsEHJg9Z-7ioHW01xzQH26ma7gRg-OCJI0EDgMLFDAeTiHn8G-t2bbs=AB9EAEFE@bitbucket.org/multicoreware/test-harness-git.git
+            git pull https://${BITBUCKET_USERNAME}:${BITBUCKET_TOKEN}@bitbucket.org/multicoreware/test-harness-git.git
         ) ELSE (
             echo "Cloning test-harness-git..."
-            git clone https://Akilan_Sivakumar:ATATT3xFfGF0dQC-D-7njcKkdJyNco1C_pbPgXDuAITR0s8T2igGU7Izr4EskQ5QeiWuMDuX8bUlLb0tXZ4yltzf60TvtnkpimbeQw_x2XDSpTomsjutMpgIuU6AmokMcsEHJg9Z-7ioHW01xzQH26ma7gRg-OCJI0EDgMLFDAeTiHn8G-t2bbs=AB9EAEFE@bitbucket.org/multicoreware/test-harness-git.git C:\jenkins_test\x265_smoke\test-harness-git
+            git clone https://${BITBUCKET_USERNAME}:${BITBUCKET_TOKEN}@bitbucket.org/multicoreware/test-harness-git.git C:\jenkins_test\x265_smoke\test-harness-git
         )
     - name: Smoke test
       shell: cmd
@@ -105,15 +263,15 @@ jobs:
 
   Linux-smoke-test:
     needs: upstream-sync
-    if: github.ref_name == 'master' && needs.upstream-sync.outputs.skip_smoke_and_reg == 'false' || startsWith(github.ref_name, 'develop/')
+    if: ((github.ref_name == 'master' && needs.upstream-sync.outputs.skip_smoke_and_reg == 'false') || startsWith(github.ref_name, 'develop/'))
     runs-on: oboe.linux
+    env:
+      DOWNSTREAM_DIR: /home/jenkins/Akilan/x265_smoke/x265_git_downstream
+      HARNESS_DIR: /home/jenkins/Akilan/x265_smoke/test-harness-git
     steps:
       - name: Preparing workspace
         shell: bash
         run: |
-          DOWNSTREAM_DIR="/home/jenkins/Akilan/x265_smoke/x265_git_downstream"
-          HARNESS_DIR="/home/jenkins/Akilan/x265_smoke/test-harness-git"
-
           if [ -d "$DOWNSTREAM_DIR" ]; then
               echo "Downstream repo exists. Deleting..."
               rm -rf "$DOWNSTREAM_DIR"
@@ -126,28 +284,28 @@ jobs:
           if [ -d "$HARNESS_DIR" ]; then
               echo "test-harness-git exists. Pulling latest changes..."
               cd "$HARNESS_DIR"
-              git pull https://Akilan_Sivakumar:ATATT3xFfGF0dQC-D-7njcKkdJyNco1C_pbPgXDuAITR0s8T2igGU7Izr4EskQ5QeiWuMDuX8bUlLb0tXZ4yltzf60TvtnkpimbeQw_x2XDSpTomsjutMpgIuU6AmokMcsEHJg9Z-7ioHW01xzQH26ma7gRg-OCJI0EDgMLFDAeTiHn8G-t2bbs=AB9EAEFE@bitbucket.org/multicoreware/test-harness-git.git
+              git pull https://${BITBUCKET_USERNAME}:${BITBUCKET_TOKEN}@bitbucket.org/multicoreware/test-harness-git.git
           else
               echo "Cloning test-harness-git..."
-              git clone https://Akilan_Sivakumar:ATATT3xFfGF0dQC-D-7njcKkdJyNco1C_pbPgXDuAITR0s8T2igGU7Izr4EskQ5QeiWuMDuX8bUlLb0tXZ4yltzf60TvtnkpimbeQw_x2XDSpTomsjutMpgIuU6AmokMcsEHJg9Z-7ioHW01xzQH26ma7gRg-OCJI0EDgMLFDAeTiHn8G-t2bbs=AB9EAEFE@bitbucket.org/multicoreware/test-harness-git.git "$HARNESS_DIR"
+              git clone https://${BITBUCKET_USERNAME}:${BITBUCKET_TOKEN}@bitbucket.org/multicoreware/test-harness-git.git "$HARNESS_DIR"
           fi
       - name: Smoke test
         shell: bash
         run: |
-          cd /home/jenkins/Akilan/x265_smoke/test-harness-git
+          cd "$HARNESS_DIR"
           python smoke-test.py
 
   Linux-regression-test:
     needs: upstream-sync
-    if: github.ref_name == 'master' && needs.upstream-sync.outputs.skip_smoke_and_reg == 'false' || startsWith(github.ref_name, 'develop/')
+    if: ((github.ref_name == 'master' && needs.upstream-sync.outputs.skip_smoke_and_reg == 'false') || startsWith(github.ref_name, 'develop/'))
     runs-on: harmonica.linux
+    env:
+      DOWNSTREAM_DIR: /home/mcw/jenkins_tests/x265_Regression/x265_git_downstream
+      HARNESS_DIR: /home/mcw/jenkins_tests/x265_Regression/test-harness-git
     steps:
       - name: Preparing workspace
         shell: bash
         run: |
-          DOWNSTREAM_DIR="/home/mcw/jenkins_tests/x265_Regression/x265_git_downstream"
-          HARNESS_DIR="/home/mcw/jenkins_tests/x265_Regression/test-harness-git"
-
           if [ -d "$DOWNSTREAM_DIR" ]; then
               echo "Downstream repo exists. Deleting..."
               rm -rf "$DOWNSTREAM_DIR"
@@ -160,13 +318,13 @@ jobs:
           if [ -d "$HARNESS_DIR" ]; then
               echo "test-harness-git exists. Pulling latest changes..."
               cd "$HARNESS_DIR"
-              git pull https://Akilan_Sivakumar:ATATT3xFfGF0dQC-D-7njcKkdJyNco1C_pbPgXDuAITR0s8T2igGU7Izr4EskQ5QeiWuMDuX8bUlLb0tXZ4yltzf60TvtnkpimbeQw_x2XDSpTomsjutMpgIuU6AmokMcsEHJg9Z-7ioHW01xzQH26ma7gRg-OCJI0EDgMLFDAeTiHn8G-t2bbs=AB9EAEFE@bitbucket.org/multicoreware/test-harness-git.git
+              git pull https://${BITBUCKET_USERNAME}:${BITBUCKET_TOKEN}@bitbucket.org/multicoreware/test-harness-git.git
           else
               echo "Cloning test-harness-git..."
-              git clone https://Akilan_Sivakumar:ATATT3xFfGF0dQC-D-7njcKkdJyNco1C_pbPgXDuAITR0s8T2igGU7Izr4EskQ5QeiWuMDuX8bUlLb0tXZ4yltzf60TvtnkpimbeQw_x2XDSpTomsjutMpgIuU6AmokMcsEHJg9Z-7ioHW01xzQH26ma7gRg-OCJI0EDgMLFDAeTiHn8G-t2bbs=AB9EAEFE@bitbucket.org/multicoreware/test-harness-git.git "$HARNESS_DIR"
+              git clone https://${BITBUCKET_USERNAME}:${BITBUCKET_TOKEN}@bitbucket.org/multicoreware/test-harness-git.git "$HARNESS_DIR"
           fi
       - name: Regression test
         shell: bash
         run: |
-          cd /home/mcw/jenkins_tests/x265_Regression/test-harness-git
+          cd "$HARNESS_DIR"
           python regression-test.py

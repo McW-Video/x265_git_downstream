@@ -215,7 +215,7 @@ jobs:
                 -H "Content-Type: application/json" \
                 -d "{
                       \"title\": \"Sync downstream master (filtered) to master\",
-                      \"head\": \"$SYNC_BRANCH\",
+                      \"head\": \"McW-Video:$SYNC_BRANCH\",
                       \"base\": \"$MASTER_BRANCH\",
                       \"body\": \"Auto-created PR with filtered commits (no pipeline files).\" 
                     }" \
